@@ -11,7 +11,9 @@ pub enum ToolStatus {
 pub struct BlackArchTool {
     pub name: String,
     pub package_name: String,
-    pub category: String,
+    pub category: Option<String>,
+    #[serde(default)]
+    pub categories: Vec<String>,
     pub version: Option<String>,
     pub description: Option<String>,
     pub executable: Option<String>,
@@ -21,12 +23,23 @@ pub struct BlackArchTool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PackageSearchResult {
+    pub repository: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub groups: Vec<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PackageInfo {
+    pub repository: Option<String>,
     pub name: String,
     pub version: Option<String>,
     pub description: Option<String>,
     pub url: Option<String>,
     pub groups: Vec<String>,
+    pub licenses: Vec<String>,
     pub installed: bool,
     pub executables: Vec<String>,
 }

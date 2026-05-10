@@ -26,6 +26,9 @@ pub enum Commands {
     Info {
         package: String,
     },
+    Search {
+        query: String,
+    },
     Executables {
         package: String,
     },
@@ -38,6 +41,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Commands::Categories) => categories(),
         Some(Commands::Tools { category }) => tools(category),
         Some(Commands::Info { package }) => info(&package),
+        Some(Commands::Search { query }) => search(&query),
         Some(Commands::Executables { package }) => executables(&package),
         Some(Commands::SyncCache) => sync_cache(),
         None => Ok(()),
@@ -50,6 +54,11 @@ fn doctor() -> Result<()> {
     match query::list_blackarch_categories() {
         Ok(categories) => println!("[ok] BlackArch groups: {} found", categories.len()),
         Err(error) => println!("[warn] BlackArch groups: {error}"),
+    }
+
+    match query::list_all_available_blackarch_tools() {
+        Ok(tools) => println!("[ok] BlackArch sync packages: {} found", tools.len()),
+        Err(error) => println!("[warn] BlackArch sync packages: {error}"),
     }
 
     match cache::paths::ensure_cache_dir() {
@@ -86,8 +95,8 @@ fn tools(category: Option<String>) -> Result<()> {
             println!("{tool}");
         }
     } else {
-        for (tool, category) in query::list_all_blackarch_tools()? {
-            println!("{tool}\t{category}");
+        for tool in query::list_all_available_blackarch_tools()? {
+            println!("{tool}");
         }
     }
 
@@ -100,8 +109,15 @@ fn info(package: &str) -> Result<()> {
     Ok(())
 }
 
+fn search(search_query: &str) -> Result<()> {
+    for result in query::search_blackarch_packages(search_query)? {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    }
+    Ok(())
+}
+
 fn executables(package: &str) -> Result<()> {
-    for executable in query::get_executables(package)? {
+    for executable in query::get_executables_if_installed(package)? {
         println!("{executable}");
     }
     Ok(())
