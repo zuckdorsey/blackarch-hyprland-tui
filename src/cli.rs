@@ -1,10 +1,13 @@
 use clap::{Parser, Subcommand};
 
 use crate::{
+    actions::terminal_runner,
     cache, config,
-    error::Result,
+    error::{AppError, Result},
+    models::{BlackArchTool, ToolStatus},
     pacman::{command, query},
     services::tool_service,
+    user_state::store as user_store,
 };
 
 #[derive(Debug, Parser)]
@@ -32,6 +35,16 @@ pub enum Commands {
     Executables {
         package: String,
     },
+    Run {
+        package: String,
+    },
+    Favorites,
+    Favorite {
+        package: String,
+    },
+    Unfavorite {
+        package: String,
+    },
     SyncCache,
 }
 
@@ -43,6 +56,10 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Commands::Info { package }) => info(&package),
         Some(Commands::Search { query }) => search(&query),
         Some(Commands::Executables { package }) => executables(&package),
+        Some(Commands::Run { package }) => run_tool(&package),
+        Some(Commands::Favorites) => favorites(),
+        Some(Commands::Favorite { package }) => favorite(&package),
+        Some(Commands::Unfavorite { package }) => unfavorite(&package),
         Some(Commands::SyncCache) => sync_cache(),
         None => Ok(()),
     }
@@ -120,6 +137,61 @@ fn executables(package: &str) -> Result<()> {
     for executable in query::get_executables_if_installed(package)? {
         println!("{executable}");
     }
+    Ok(())
+}
+
+fn run_tool(package: &str) -> Result<()> {
+    let tool = tool_service::get_tool_detail(package)?;
+    let executable = executable_for_run(&tool)?;
+    let config = config::settings::load_config()?;
+
+    if config.terminal.hold_after_run {
+        return Err(AppError::Config(
+            "hold_after_run is not supported without shell wrapping yet".to_string(),
+        ));
+    }
+
+    terminal_runner::run_in_terminal(
+        &config.terminal.program,
+        &config.terminal.runner_class,
+        &executable,
+    )?;
+    user_store::add_recent_tool(&tool.package_name, Some(&executable))?;
+    println!("launched {executable}");
+    Ok(())
+}
+
+fn executable_for_run(tool: &BlackArchTool) -> Result<String> {
+    if tool.status != ToolStatus::Installed {
+        return Err(AppError::Config("Package is not installed".to_string()));
+    }
+
+    tool.executable
+        .clone()
+        .or_else(|| tool.executables.first().cloned())
+        .ok_or_else(|| AppError::Config("No executable found for this package".to_string()))
+}
+
+fn favorites() -> Result<()> {
+    for favorite in user_store::load_favorites()? {
+        println!("{favorite}");
+    }
+    Ok(())
+}
+
+fn favorite(package: &str) -> Result<()> {
+    if !user_store::is_favorite(package)? {
+        user_store::toggle_favorite(package)?;
+    }
+    println!("added {package}");
+    Ok(())
+}
+
+fn unfavorite(package: &str) -> Result<()> {
+    let mut favorites = user_store::load_favorites()?;
+    favorites.retain(|favorite| favorite != package);
+    user_store::save_favorites(&favorites)?;
+    println!("removed {package}");
     Ok(())
 }
 

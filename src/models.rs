@@ -44,6 +44,58 @@ pub struct PackageInfo {
     pub executables: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct UserState {
+    pub favorites: Vec<String>,
+    pub recent: Vec<RecentTool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecentTool {
+    pub package_name: String,
+    #[serde(default)]
+    pub executable: Option<String>,
+    pub last_used: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ActionMenuItem {
+    RunInTerminal,
+    InstallOrUpdate,
+    Remove,
+    ToggleFavorite,
+    CopyCommand,
+    RefreshDetails,
+    PackageInfo,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionMenuState {
+    pub visible: bool,
+    pub selected_index: usize,
+    pub items: Vec<ActionMenuItem>,
+}
+
+impl Default for ActionMenuState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            selected_index: 0,
+            items: vec![
+                ActionMenuItem::RunInTerminal,
+                ActionMenuItem::InstallOrUpdate,
+                ActionMenuItem::Remove,
+                ActionMenuItem::ToggleFavorite,
+                ActionMenuItem::CopyCommand,
+                ActionMenuItem::RefreshDetails,
+                ActionMenuItem::PackageInfo,
+                ActionMenuItem::Cancel,
+            ],
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlackArchCategory {
@@ -75,6 +127,8 @@ pub struct PacmanConfig {
 pub struct TerminalConfig {
     pub program: String,
     pub runner_class: String,
+    #[serde(default)]
+    pub hold_after_run: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,6 +152,7 @@ impl Default for AppConfig {
             terminal: TerminalConfig {
                 program: "kitty".to_string(),
                 runner_class: "blackarch-tool-runner".to_string(),
+                hold_after_run: false,
             },
         }
     }

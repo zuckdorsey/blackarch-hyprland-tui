@@ -1,3 +1,4 @@
+mod actions;
 mod app;
 mod cache;
 mod cli;
@@ -8,7 +9,9 @@ mod models;
 mod pacman;
 mod services;
 mod ui;
+mod user_state;
 mod utils;
+mod worker;
 
 use clap::Parser;
 

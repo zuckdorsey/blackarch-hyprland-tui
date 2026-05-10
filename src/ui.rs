@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::{
+    actions::action_menu,
     app::{App, FocusPane, display_category_name},
     models::{BlackArchTool, ToolStatus},
 };
@@ -38,6 +39,10 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_header(frame, page[0], app);
     render_body(frame, page[1], app);
     render_status_bar(frame, page[2], app);
+
+    if app.action_menu.visible {
+        render_action_menu(frame, area, app);
+    }
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -221,7 +226,14 @@ fn tool_row(tool: &BlackArchTool, selected: bool) -> Row<'static> {
     let status = status_label(&tool.status).to_string();
 
     Row::new([
-        Cell::from(if selected { ">" } else { " " }).style(base),
+        Cell::from(if selected {
+            ">"
+        } else if tool.favorite {
+            "*"
+        } else {
+            " "
+        })
+        .style(base),
         Cell::from(tool.name.clone()).style(if selected {
             base.add_modifier(Modifier::BOLD)
         } else {
@@ -246,7 +258,7 @@ fn render_details(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let text = match app.selected_tool() {
-        Some(tool) => details_lines(tool),
+        Some(tool) => details_lines(tool, app.detail_loading),
         None => vec![Line::from(Span::styled(
             "No tool selected",
             Style::default().fg(MUTED),
@@ -261,11 +273,11 @@ fn render_details(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(details, area);
 }
 
-fn details_lines(tool: &BlackArchTool) -> Vec<Line<'static>> {
+fn details_lines(tool: &BlackArchTool, detail_loading: bool) -> Vec<Line<'static>> {
     let executable = tool.executable.as_deref().unwrap_or("-");
     let version = tool.version.as_deref().unwrap_or("-");
     let description = tool.description.as_deref().unwrap_or_else(|| {
-        if tool.version.is_none() {
+        if detail_loading {
             "Loading package details..."
         } else {
             "No description available."
@@ -288,6 +300,7 @@ fn details_lines(tool: &BlackArchTool) -> Vec<Line<'static>> {
         detail_line("Category", &display_tool_category(tool), TEXT),
         detail_line("Version", version, TEXT),
         detail_line("Executable", executable, TEXT),
+        detail_line("Favorite", if tool.favorite { "yes" } else { "no" }, TEXT),
         detail_line(
             "Status",
             status_label(&tool.status),
@@ -449,6 +462,50 @@ fn render_center_message(frame: &mut Frame, area: Rect, title: &str, message: Op
     frame.render_widget(paragraph, popup);
 }
 
+fn render_action_menu(frame: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(36, 42, area);
+    let package_name = app
+        .selected_tool()
+        .map(|tool| tool.package_name.as_str())
+        .unwrap_or("tool");
+    let favorite = app.is_selected_tool_favorite();
+
+    let items = app
+        .action_menu
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let selected = index == app.action_menu.selected_index;
+            let label = action_menu::item_label(*item, favorite);
+            if selected {
+                ListItem::new(Line::from(vec![
+                    Span::styled("> ", Style::default().fg(WHITE).bg(MAUVE)),
+                    Span::styled(
+                        label.to_string(),
+                        Style::default()
+                            .fg(WHITE)
+                            .bg(MAUVE)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]))
+                .style(Style::default().bg(MAUVE))
+            } else {
+                ListItem::new(Line::from(vec![
+                    Span::styled("  ", Style::default().fg(MUTED)),
+                    Span::styled(label.to_string(), Style::default().fg(TEXT)),
+                ]))
+            }
+        });
+
+    let menu = List::new(items)
+        .style(Style::default().bg(BG))
+        .block(titled_block_owned(format!(" Actions: {package_name} ")));
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(menu, popup);
+}
+
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -497,6 +554,13 @@ fn truncate(value: &str, max_chars: usize) -> String {
 fn titled_block(title: &'static str) -> Block<'static> {
     base_block().title(Span::styled(
         format!(" {title} "),
+        Style::default().fg(MAUVE).add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn titled_block_owned(title: String) -> Block<'static> {
+    base_block().title(Span::styled(
+        title,
         Style::default().fg(MAUVE).add_modifier(Modifier::BOLD),
     ))
 }

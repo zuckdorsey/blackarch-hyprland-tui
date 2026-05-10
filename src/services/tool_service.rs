@@ -1,4 +1,9 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::{Arc, Mutex, mpsc},
+    thread,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::{
     cache::store,
@@ -20,24 +25,8 @@ pub fn load_tools(prefer_cache: bool) -> Result<Vec<BlackArchTool>> {
 
 pub fn refresh_tools_cache() -> Result<Vec<BlackArchTool>> {
     let categories_by_tool = query::package_categories()?;
-    let tools = query::list_all_available_blackarch_tools()?
-        .into_iter()
-        .filter_map(|package_name| {
-            let categories = categories_by_tool
-                .get(&package_name)
-                .cloned()
-                .unwrap_or_default();
-            let fallback_category = categories.first().map(String::as_str);
-
-            match query::build_available_tool(&package_name, fallback_category) {
-                Ok(mut tool) => {
-                    tool.categories = categories;
-                    Some(tool)
-                }
-                Err(_) => Some(minimal_available_tool(package_name, categories)),
-            }
-        })
-        .collect::<Vec<_>>();
+    let package_names = query::list_all_available_blackarch_tools()?;
+    let tools = build_available_tools_with_status(package_names, categories_by_tool);
 
     store::save_tools_cache(&tools)?;
     store::save_metadata(&CacheMetadata {
@@ -92,6 +81,7 @@ pub fn get_tool_detail(package_name: &str) -> Result<BlackArchTool> {
     })
 }
 
+#[allow(dead_code)]
 pub fn get_tool_detail_or_partial(
     package_name: &str,
     fallback: Option<&BlackArchTool>,
@@ -148,4 +138,59 @@ fn minimal_available_tool(package_name: String, categories: Vec<String>) -> Blac
         status: ToolStatus::NotInstalled,
         favorite: false,
     }
+}
+
+fn build_available_tools_with_status(
+    package_names: Vec<String>,
+    categories_by_tool: BTreeMap<String, Vec<String>>,
+) -> Vec<BlackArchTool> {
+    let worker_count = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .clamp(1, 16);
+    let queue = Arc::new(Mutex::new(VecDeque::from(package_names)));
+    let categories_by_tool = Arc::new(categories_by_tool);
+    let (tool_tx, tool_rx) = mpsc::channel();
+    let mut handles = Vec::new();
+
+    for _ in 0..worker_count {
+        let queue = Arc::clone(&queue);
+        let categories_by_tool = Arc::clone(&categories_by_tool);
+        let tool_tx = tool_tx.clone();
+
+        handles.push(thread::spawn(move || {
+            loop {
+                let Some(package_name) = queue.lock().ok().and_then(|mut queue| queue.pop_front())
+                else {
+                    break;
+                };
+
+                let categories = categories_by_tool
+                    .get(&package_name)
+                    .cloned()
+                    .unwrap_or_default();
+                let fallback_category = categories.first().map(String::as_str);
+                let tool = match query::build_available_tool(&package_name, fallback_category) {
+                    Ok(mut tool) => {
+                        tool.categories = categories;
+                        tool
+                    }
+                    Err(_) => minimal_available_tool(package_name, categories),
+                };
+
+                if tool_tx.send(tool).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    drop(tool_tx);
+
+    let mut tools = tool_rx.into_iter().collect::<Vec<_>>();
+    for handle in handles {
+        let _ = handle.join();
+    }
+    tools.sort_by(|left, right| left.package_name.cmp(&right.package_name));
+    tools
 }
