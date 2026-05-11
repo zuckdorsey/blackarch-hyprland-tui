@@ -13,6 +13,14 @@ pub fn handle_events(app: &mut App, worker_tx: &mpsc::Sender<WorkerCommand>) -> 
         return Ok(());
     };
 
+    if app.confirm_modal.visible {
+        return handle_confirmation_modal_key(app, key.code, worker_tx);
+    }
+
+    if app.install_queue_modal_visible {
+        return handle_install_queue_key(app, key.code);
+    }
+
     if app.action_menu.visible {
         return handle_action_menu_key(app, key.code, worker_tx);
     }
@@ -36,18 +44,19 @@ pub fn handle_events(app: &mut App, worker_tx: &mpsc::Sender<WorkerCommand>) -> 
             _ => app.select_next_tool(),
         },
         KeyCode::Enter => app.open_action_menu(),
+        KeyCode::Char('a') => {
+            let result = app.toggle_selected_package_in_queue();
+            handle_local_result(app, result);
+        }
+        KeyCode::Char('I') => app.open_install_queue_modal(),
         KeyCode::Char('s') => app.begin_sync_cache(worker_tx),
         KeyCode::Char('d') => app.refresh_selected_tool_detail(worker_tx),
         KeyCode::Char('r') => {
             let result = app.run_selected_tool(worker_tx);
             handle_local_result(app, result);
         }
-        KeyCode::Char('i') => {
-            app.status_message = "Install action is not implemented yet".to_string()
-        }
-        KeyCode::Char('x') => {
-            app.status_message = "Remove action is not implemented yet".to_string()
-        }
+        KeyCode::Char('i') => app.open_install_confirmation_for_selected_package(),
+        KeyCode::Char('x') => app.open_remove_confirmation_for_selected_package(),
         KeyCode::Char('f') => {
             let result = app.toggle_selected_favorite();
             handle_local_result(app, result);
@@ -67,6 +76,19 @@ pub fn handle_events(app: &mut App, worker_tx: &mpsc::Sender<WorkerCommand>) -> 
     Ok(())
 }
 
+fn handle_install_queue_key(app: &mut App, code: KeyCode) -> Result<()> {
+    match code {
+        KeyCode::Up => app.select_previous_queue_item(),
+        KeyCode::Down => app.select_next_queue_item(),
+        KeyCode::Char('a') | KeyCode::Delete => app.remove_selected_queue_item(),
+        KeyCode::Enter => app.open_install_confirmation_for_queue(),
+        KeyCode::Esc | KeyCode::Char('q') => app.close_install_queue_modal(),
+        _ => {}
+    }
+
+    Ok(())
+}
+
 fn handle_action_menu_key(
     app: &mut App,
     code: KeyCode,
@@ -80,6 +102,33 @@ fn handle_action_menu_key(
             handle_local_result(app, result);
         }
         KeyCode::Esc | KeyCode::Char('q') => app.close_action_menu(),
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn handle_confirmation_modal_key(
+    app: &mut App,
+    code: KeyCode,
+    worker_tx: &mpsc::Sender<WorkerCommand>,
+) -> Result<()> {
+    match code {
+        KeyCode::Left | KeyCode::Right | KeyCode::Tab => app.toggle_confirmation_selection(),
+        KeyCode::Enter => {
+            let result = app.confirm_modal_action(worker_tx);
+            handle_local_result(app, result);
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            let action = app.confirm_modal.action.clone();
+            app.close_confirmation_modal();
+            app.status_message = match action {
+                Some(crate::models::ConfirmAction::RemovePackage { .. }) => {
+                    "Remove cancelled".to_string()
+                }
+                _ => "Install cancelled".to_string(),
+            };
+        }
         _ => {}
     }
 

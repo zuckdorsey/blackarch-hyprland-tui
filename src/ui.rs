@@ -9,7 +9,7 @@ use ratatui::{
 use crate::{
     actions::action_menu,
     app::{App, FocusPane, display_category_name},
-    models::{BlackArchTool, ToolStatus},
+    models::{BlackArchTool, ConfirmAction, ToolStatus},
 };
 
 const BG: Color = Color::Rgb(24, 24, 37);
@@ -21,6 +21,7 @@ const MAUVE: Color = Color::Rgb(203, 166, 247);
 const CYAN: Color = Color::Rgb(137, 220, 235);
 const GREEN: Color = Color::Rgb(166, 227, 161);
 const AMBER: Color = Color::Rgb(249, 226, 175);
+const RED: Color = Color::Rgb(243, 139, 168);
 const WHITE: Color = Color::Rgb(245, 245, 255);
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -40,7 +41,13 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_body(frame, page[1], app);
     render_status_bar(frame, page[2], app);
 
-    if app.action_menu.visible {
+    if app.confirm_modal.visible {
+        render_confirmation_modal(frame, area, app);
+    } else if app.password_input_modal.visible {
+        render_password_input_modal(frame, area, app);
+    } else if app.install_queue_modal_visible {
+        render_install_queue_modal(frame, area, app);
+    } else if app.action_menu.visible {
         render_action_menu(frame, area, app);
     }
 }
@@ -193,11 +200,13 @@ fn render_tools(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let rows = app
-        .filtered_tools
-        .iter()
-        .enumerate()
-        .map(|(index, tool)| tool_row(tool, index == app.selected_tool_index));
+    let rows = app.filtered_tools.iter().enumerate().map(|(index, tool)| {
+        tool_row(
+            tool,
+            index == app.selected_tool_index,
+            app.install_queue.contains(&tool.package_name),
+        )
+    });
 
     let table = Table::new(
         rows,
@@ -217,7 +226,7 @@ fn render_tools(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(table, chunks[1]);
 }
 
-fn tool_row(tool: &BlackArchTool, selected: bool) -> Row<'static> {
+fn tool_row(tool: &BlackArchTool, selected: bool, queued: bool) -> Row<'static> {
     let base = if selected {
         Style::default().fg(WHITE).bg(MAUVE)
     } else {
@@ -228,6 +237,8 @@ fn tool_row(tool: &BlackArchTool, selected: bool) -> Row<'static> {
     Row::new([
         Cell::from(if selected {
             ">"
+        } else if queued {
+            "+"
         } else if tool.favorite {
             "*"
         } else {
@@ -399,8 +410,16 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     .style(Style::default().bg(SURFACE));
 
     let message = app.error_message.as_deref().unwrap_or(&app.status_message);
+    let status_text = if app.install_queue.is_empty() {
+        truncate(message, 41)
+    } else {
+        truncate(
+            &format!("{message} • Queue: {}", app.install_queue.len()),
+            41,
+        )
+    };
     let activity = Paragraph::new(Line::from(Span::styled(
-        truncate(message, 41),
+        status_text,
         if app.error_message.is_some() {
             Style::default().fg(AMBER)
         } else {
@@ -504,6 +523,180 @@ fn render_action_menu(frame: &mut Frame, area: Rect, app: &App) {
 
     frame.render_widget(Clear, popup);
     frame.render_widget(menu, popup);
+}
+
+fn render_confirmation_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(48, 42, area);
+    let modal = &app.confirm_modal;
+    let command = modal.command_preview.as_deref().unwrap_or("-");
+
+    let cancel_style = if modal.selected_confirm {
+        Style::default().fg(TEXT).bg(BG)
+    } else {
+        Style::default()
+            .fg(WHITE)
+            .bg(MAUVE)
+            .add_modifier(Modifier::BOLD)
+    };
+    let confirm_accent = if matches!(
+        modal.action.as_ref(),
+        Some(ConfirmAction::RemovePackage { .. })
+    ) {
+        RED
+    } else {
+        MAUVE
+    };
+    let confirm_style = if modal.selected_confirm {
+        Style::default()
+            .fg(WHITE)
+            .bg(confirm_accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(TEXT).bg(BG)
+    };
+
+    let mut lines = modal
+        .message
+        .lines()
+        .map(|line| Line::from(Span::styled(line.to_string(), Style::default().fg(TEXT))))
+        .collect::<Vec<_>>();
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("Command: ", Style::default().fg(MUTED)),
+        Span::styled(command.to_string(), Style::default().fg(CYAN)),
+    ]));
+
+    if let Some(status) = &app.privilege_status {
+        if !status.pkexec_found {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "pkexec not found. Install polkit first.",
+                Style::default().fg(AMBER),
+            )));
+        } else if !status.polkit_agent_detected {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                "Warning: No polkit authentication agent detected.",
+                Style::default().fg(AMBER),
+            )));
+            lines.push(Line::from(Span::styled(
+                "Hint: add `exec-once = hyprpolkitagent` to hyprland.conf",
+                Style::default().fg(MUTED),
+            )));
+        }
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::raw("              "),
+        Span::styled(format!("[{}]", modal.cancel_label), cancel_style),
+        Span::raw("        "),
+        Span::styled(format!("[{}]", modal.confirm_label), confirm_style),
+    ]));
+
+    let paragraph = Paragraph::new(lines)
+        .style(Style::default().bg(BG))
+        .wrap(Wrap { trim: true })
+        .block(titled_block_owned(format!(" {} ", modal.title)));
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
+}
+
+fn render_password_input_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(48, 42, area);
+    let modal = &app.password_input_modal;
+    let masked_password = "*".repeat(modal.password.len());
+
+    let mut lines = modal
+        .message
+        .lines()
+        .map(|line| Line::from(Span::styled(line.to_string(), Style::default().fg(TEXT))))
+        .collect::<Vec<_>>();
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("Password: ", Style::default().fg(MUTED)),
+        Span::styled(masked_password, Style::default().fg(CYAN)),
+        Span::styled("_", Style::default().fg(MAUVE)),
+    ]));
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::raw("              "),
+        Span::styled(
+            format!("[{}]", modal.cancel_label),
+            Style::default().fg(TEXT).bg(BG),
+        ),
+        Span::raw("        "),
+        Span::styled(
+            format!("[{}]", modal.confirm_label),
+            Style::default()
+                .fg(WHITE)
+                .bg(MAUVE)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    let paragraph = Paragraph::new(lines)
+        .style(Style::default().bg(BG))
+        .wrap(Wrap { trim: true })
+        .block(titled_block_owned(format!(" {} ", modal.title)));
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
+}
+
+fn render_install_queue_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(42, 48, area);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("Packages queued: {}", app.install_queue.len()),
+            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+    ];
+
+    if app.install_queue.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No packages in install queue",
+            Style::default().fg(MUTED),
+        )));
+    } else {
+        for (index, package_name) in app.install_queue.packages.iter().enumerate() {
+            let selected = index == app.install_queue_selected_index;
+            if selected {
+                lines.push(Line::from(vec![
+                    Span::styled("> ", Style::default().fg(WHITE).bg(MAUVE)),
+                    Span::styled(
+                        package_name.clone(),
+                        Style::default()
+                            .fg(WHITE)
+                            .bg(MAUVE)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default().fg(MUTED)),
+                    Span::styled(package_name.clone(), Style::default().fg(TEXT)),
+                ]));
+            }
+        }
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "a remove selected  Enter confirm  Esc back",
+        Style::default().fg(MUTED),
+    )));
+
+    let paragraph = Paragraph::new(lines)
+        .style(Style::default().bg(BG))
+        .wrap(Wrap { trim: true })
+        .block(titled_block_owned(" Install Queue ".to_string()));
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(paragraph, popup);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

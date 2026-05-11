@@ -11,12 +11,19 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::{
-    actions::{action_menu, clipboard},
+    actions::{
+        action_menu, clipboard,
+        privilege::{self, PrivilegeStatus},
+    },
     error::{AppError, Result},
     event,
-    models::{ActionMenuItem, ActionMenuState, BlackArchTool, RecentTool, ToolStatus, UserState},
+    models::{
+        ActionMenuItem, ActionMenuState, BlackArchTool, ConfirmAction, ConfirmModalState,
+        InstallQueue, PasswordInputModalState, RecentTool, ToolStatus, UserState,
+    },
     ui,
     user_state::store as user_store,
+    utils::validate::validate_package_name,
     worker::{WorkerCommand, WorkerEvent, start_worker},
 };
 
@@ -49,6 +56,15 @@ pub struct App {
     pub detail_debounce_ms: u64,
     pub user_state: UserState,
     pub action_menu: ActionMenuState,
+    pub confirm_modal: ConfirmModalState,
+    pub password_input_modal: PasswordInputModalState,
+    pub install_queue: InstallQueue,
+    pub install_queue_modal_visible: bool,
+    pub install_queue_selected_index: usize,
+    pub install_in_progress: bool,
+    pub current_install_request_id: Option<u64>,
+    pub current_remove_request_id: Option<u64>,
+    pub privilege_status: Option<PrivilegeStatus>,
     pub should_quit: bool,
 }
 
@@ -76,6 +92,15 @@ impl App {
             detail_debounce_ms: 200,
             user_state: UserState::default(),
             action_menu: action_menu::default_state(),
+            confirm_modal: ConfirmModalState::default(),
+            password_input_modal: PasswordInputModalState::default(),
+            install_queue: InstallQueue::new(),
+            install_queue_modal_visible: false,
+            install_queue_selected_index: 0,
+            install_in_progress: false,
+            current_install_request_id: None,
+            current_remove_request_id: None,
+            privilege_status: None,
             should_quit: false,
         }
     }
@@ -95,6 +120,7 @@ impl App {
         self.loading = true;
         self.status_message = "Loading BlackArch tools...".to_string();
         self.error_message = None;
+        self.refresh_privilege_status();
         let _ = worker_tx.send(WorkerCommand::LoadInitialData);
     }
 
@@ -329,11 +355,11 @@ impl App {
             }
             Some(ActionMenuItem::InstallOrUpdate) => {
                 self.close_action_menu();
-                self.status_message = "Install action is not implemented yet".to_string();
+                self.open_install_confirmation_for_selected_package();
             }
             Some(ActionMenuItem::Remove) => {
                 self.close_action_menu();
-                self.status_message = "Remove action is not implemented yet".to_string();
+                self.open_remove_confirmation_for_selected_package();
             }
             Some(ActionMenuItem::ToggleFavorite) => {
                 self.close_action_menu();
@@ -389,6 +415,480 @@ impl App {
             request_id,
         });
         Ok(())
+    }
+
+    pub fn toggle_selected_package_in_queue(&mut self) -> Result<()> {
+        let Some(package_name) = self.selected_tool().map(|tool| tool.package_name.clone()) else {
+            self.status_message = "No package selected".to_string();
+            return Ok(());
+        };
+
+        self.validate_install_package(&package_name)?;
+        let added = self.install_queue.toggle(package_name.clone());
+        self.status_message = if added {
+            format!("Added {package_name} to install queue")
+        } else {
+            format!("Removed {package_name} from install queue")
+        };
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn add_selected_package_to_queue(&mut self) -> Result<()> {
+        let Some(package_name) = self.selected_tool().map(|tool| tool.package_name.clone()) else {
+            self.status_message = "No package selected".to_string();
+            return Ok(());
+        };
+
+        self.validate_install_package(&package_name)?;
+        if self.install_queue.add(package_name.clone()) {
+            self.status_message = format!("Added {package_name} to install queue");
+        } else {
+            self.status_message = format!("{package_name} is already queued");
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn remove_selected_package_from_queue(&mut self) -> Result<()> {
+        let Some(package_name) = self.selected_tool().map(|tool| tool.package_name.clone()) else {
+            self.status_message = "No package selected".to_string();
+            return Ok(());
+        };
+
+        if self.install_queue.remove(&package_name) {
+            self.status_message = format!("Removed {package_name} from install queue");
+        } else {
+            self.status_message = format!("{package_name} is not queued");
+        }
+        Ok(())
+    }
+
+    pub fn open_install_queue_modal(&mut self) {
+        if self.install_queue.is_empty() {
+            self.status_message = "Install queue is empty".to_string();
+            return;
+        }
+
+        self.install_queue_modal_visible = true;
+        self.install_queue_selected_index = self
+            .install_queue_selected_index
+            .min(self.install_queue.len().saturating_sub(1));
+    }
+
+    pub fn close_install_queue_modal(&mut self) {
+        self.install_queue_modal_visible = false;
+    }
+
+    pub fn select_next_queue_item(&mut self) {
+        if self.install_queue.is_empty() {
+            self.install_queue_selected_index = 0;
+            return;
+        }
+        self.install_queue_selected_index =
+            (self.install_queue_selected_index + 1) % self.install_queue.len();
+    }
+
+    pub fn select_previous_queue_item(&mut self) {
+        if self.install_queue.is_empty() {
+            self.install_queue_selected_index = 0;
+            return;
+        }
+        self.install_queue_selected_index = if self.install_queue_selected_index == 0 {
+            self.install_queue.len() - 1
+        } else {
+            self.install_queue_selected_index - 1
+        };
+    }
+
+    pub fn remove_selected_queue_item(&mut self) {
+        let Some(package_name) = self
+            .install_queue
+            .packages
+            .get(self.install_queue_selected_index)
+            .cloned()
+        else {
+            self.status_message = "Install queue is empty".to_string();
+            return;
+        };
+
+        self.install_queue.remove(&package_name);
+        self.install_queue_selected_index = self
+            .install_queue_selected_index
+            .min(self.install_queue.len().saturating_sub(1));
+        self.status_message = format!("Removed {package_name} from install queue");
+    }
+
+    pub fn open_install_confirmation_for_selected_package(&mut self) {
+        let Some(package_name) = self.selected_tool().map(|tool| tool.package_name.clone()) else {
+            self.status_message = "No package selected".to_string();
+            return;
+        };
+
+        self.open_install_confirmation_for_packages(vec![package_name]);
+    }
+
+    pub fn open_remove_confirmation_for_selected_package(&mut self) {
+        let Some(tool) = self.selected_tool().cloned() else {
+            self.status_message = "No package selected".to_string();
+            return;
+        };
+        let package_name = tool.package_name.clone();
+
+        if self.install_in_progress {
+            self.status_message = "Another package operation is already in progress".to_string();
+            return;
+        }
+
+        if tool.status != ToolStatus::Installed {
+            self.status_message = "Package is not installed".to_string();
+            return;
+        }
+
+        if let Err(error) = self.validate_remove_package(&package_name) {
+            let message = error.to_string();
+            self.error_message = Some(message.clone());
+            self.status_message = message;
+            return;
+        }
+
+        self.refresh_privilege_status();
+        self.confirm_modal = ConfirmModalState {
+            visible: true,
+            title: "Remove Package".to_string(),
+            message: format!(
+                "Package: {package_name}\n\nThis will remove the package and unused dependencies using pacman."
+            ),
+            command_preview: Some(format!("pkexec pacman -Rns --noconfirm {package_name}")),
+            confirm_label: "Remove".to_string(),
+            cancel_label: "Cancel".to_string(),
+            selected_confirm: false,
+            action: Some(ConfirmAction::RemovePackage { package_name }),
+        };
+    }
+
+    pub fn open_install_confirmation_for_queue(&mut self) {
+        if self.install_queue.is_empty() {
+            self.status_message = "Install queue is empty".to_string();
+            return;
+        }
+
+        self.open_install_confirmation_for_packages(self.install_queue.packages.clone());
+    }
+
+    #[allow(dead_code)]
+    pub fn open_install_confirmation(&mut self) {
+        self.open_install_confirmation_for_selected_package();
+    }
+
+    fn open_install_confirmation_for_packages(&mut self, packages: Vec<String>) {
+        for package_name in &packages {
+            if let Err(error) = self.validate_install_package(package_name) {
+                self.error_message = Some(error.to_string());
+                self.status_message = "Install validation failed".to_string();
+                return;
+            }
+        }
+
+        if packages.is_empty() {
+            self.status_message = "Install queue is empty".to_string();
+            return;
+        }
+
+        self.refresh_privilege_status();
+        let title = if packages.len() == 1 {
+            "Install Package".to_string()
+        } else {
+            "Install Packages".to_string()
+        };
+        let message = if packages.len() == 1 {
+            format!(
+                "Package: {}\n\nThis will install or update this package using pacman.\nA system authentication prompt may appear.",
+                packages[0]
+            )
+        } else {
+            format!(
+                "Packages: {}\n\nThis will install or update all queued packages using pacman.\nA system authentication prompt may appear.",
+                packages.len()
+            )
+        };
+        let command_preview = format!(
+            "pkexec pacman -S --needed --noconfirm {}",
+            packages.join(" ")
+        );
+
+        self.confirm_modal = ConfirmModalState {
+            visible: true,
+            title,
+            message,
+            command_preview: Some(command_preview),
+            confirm_label: "Install".to_string(),
+            cancel_label: "Cancel".to_string(),
+            selected_confirm: false,
+            action: Some(ConfirmAction::InstallPackages { packages }),
+        };
+    }
+
+    pub fn refresh_privilege_status(&mut self) {
+        self.privilege_status = Some(privilege::check_privilege_status());
+    }
+
+    fn ensure_install_privileges_ready(&mut self) -> Result<()> {
+        self.refresh_privilege_status();
+        if self
+            .privilege_status
+            .as_ref()
+            .is_some_and(|status| !status.pkexec_found)
+        {
+            return Err(AppError::Config(
+                "pkexec not found. Install polkit and make sure a polkit authentication agent is running."
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn open_install_confirmation_legacy(&mut self) {
+        let Some(package_name) = self.selected_tool().map(|tool| tool.package_name.clone()) else {
+            self.status_message = "No package selected".to_string();
+            return;
+        };
+
+        if let Err(error) = self.validate_install_package(&package_name) {
+            self.error_message = Some(error.to_string());
+            self.status_message = "Install validation failed".to_string();
+            return;
+        }
+
+        self.confirm_modal = ConfirmModalState {
+            visible: true,
+            title: "Install Package".to_string(),
+            message: format!(
+                "Package: {package_name}\n\nThis will install or update this package using pacman."
+            ),
+            command_preview: Some(format!(
+                "pkexec pacman -S --needed --noconfirm {package_name}"
+            )),
+            confirm_label: "Install".to_string(),
+            cancel_label: "Cancel".to_string(),
+            selected_confirm: false,
+            action: Some(ConfirmAction::InstallPackages {
+                packages: vec![package_name],
+            }),
+        };
+    }
+
+    pub fn close_confirmation_modal(&mut self) {
+        self.confirm_modal = ConfirmModalState::default();
+    }
+
+    pub fn toggle_confirmation_selection(&mut self) {
+        self.confirm_modal.selected_confirm = !self.confirm_modal.selected_confirm;
+    }
+
+    pub fn confirm_modal_action(&mut self, worker_tx: &mpsc::Sender<WorkerCommand>) -> Result<()> {
+        let action = self.confirm_modal.action.clone();
+        if !self.confirm_modal.selected_confirm {
+            self.close_confirmation_modal();
+            self.status_message = cancel_message_for_action(action.as_ref()).to_string();
+            return Ok(());
+        }
+
+        self.close_confirmation_modal();
+
+        match action {
+            Some(ConfirmAction::InstallPackages { packages }) => {
+                self.start_install_packages(packages.clone(), worker_tx)?;
+            }
+            Some(ConfirmAction::RemovePackage { package_name }) => {
+                self.start_remove_package(package_name, worker_tx)?;
+            }
+            None => self.status_message = "No install action selected".to_string(),
+        }
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn start_install_package(
+        &mut self,
+        package_name: String,
+        worker_tx: &mpsc::Sender<WorkerCommand>,
+    ) -> Result<()> {
+        self.start_install_packages(vec![package_name], worker_tx)
+    }
+
+    pub fn start_install_packages(
+        &mut self,
+        packages: Vec<String>,
+        worker_tx: &mpsc::Sender<WorkerCommand>,
+    ) -> Result<()> {
+        if self.install_in_progress {
+            self.status_message = "Another package operation is already in progress".to_string();
+            return Ok(());
+        }
+
+        if packages.is_empty() {
+            self.status_message = "Install queue is empty".to_string();
+            return Ok(());
+        }
+
+        self.ensure_install_privileges_ready()?;
+        for package_name in &packages {
+            self.validate_install_package(package_name)?;
+        }
+
+        let request_id = self.next_request_id();
+        self.install_in_progress = true;
+        self.current_install_request_id = Some(request_id);
+        self.install_queue_modal_visible = false;
+        self.error_message = None;
+        self.status_message = "Waiting for authentication prompt...".to_string();
+
+        let _ = worker_tx.send(WorkerCommand::InstallPackages {
+            package_names: packages,
+            request_id,
+        });
+        Ok(())
+    }
+
+    pub fn apply_install_success(
+        &mut self,
+        package_name: &str,
+        refreshed_tool: Option<BlackArchTool>,
+    ) {
+        self.apply_batch_install_success(
+            &[package_name.to_string()],
+            refreshed_tool.into_iter().collect(),
+        );
+    }
+
+    pub fn apply_batch_install_success(
+        &mut self,
+        packages: &[String],
+        refreshed_tools: Vec<BlackArchTool>,
+    ) {
+        self.install_in_progress = false;
+        self.current_install_request_id = None;
+        self.error_message = None;
+
+        let refreshed_count = refreshed_tools.len();
+        for tool in refreshed_tools {
+            let package_name = tool.package_name.clone();
+            self.update_tool_record(&package_name, tool);
+        }
+        for package_name in packages {
+            self.update_tool_status(package_name, ToolStatus::Installed);
+            self.install_queue.remove(package_name);
+        }
+        self.install_queue_selected_index = self
+            .install_queue_selected_index
+            .min(self.install_queue.len().saturating_sub(1));
+        if self.install_queue.is_empty() {
+            self.install_queue_modal_visible = false;
+        }
+
+        self.apply_filters();
+        let message = if refreshed_count < packages.len() {
+            "Installed packages, but some details could not be refreshed".to_string()
+        } else {
+            format!("Installed {} package(s) successfully", packages.len())
+        };
+        self.status_message = message.clone();
+    }
+
+    pub fn apply_install_failure(&mut self, package_name: &str, error: String) {
+        self.apply_batch_install_failure(&[package_name.to_string()], error);
+    }
+
+    pub fn apply_batch_install_failure(&mut self, packages: &[String], error: String) {
+        self.install_in_progress = false;
+        self.current_install_request_id = None;
+        self.error_message = Some(error);
+        self.status_message = if packages.len() == 1 {
+            format!("Failed to install {}", packages[0])
+        } else {
+            "Install failed".to_string()
+        };
+    }
+
+    pub fn start_remove_package(
+        &mut self,
+        package_name: String,
+        worker_tx: &mpsc::Sender<WorkerCommand>,
+    ) -> Result<()> {
+        if self.install_in_progress {
+            self.status_message = "Another package operation is already in progress".to_string();
+            return Ok(());
+        }
+
+        self.validate_remove_package(&package_name)?;
+        self.refresh_privilege_status();
+        if self
+            .privilege_status
+            .as_ref()
+            .is_some_and(|status| !status.pkexec_found)
+        {
+            return Err(AppError::Config(
+                "pkexec not found. Install polkit and make sure a polkit authentication agent is running."
+                    .to_string(),
+            ));
+        }
+
+        let request_id = self.next_request_id();
+        self.install_in_progress = true;
+        self.current_remove_request_id = Some(request_id);
+        self.error_message = None;
+        self.status_message = "Waiting for authentication prompt...".to_string();
+
+        let _ = worker_tx.send(WorkerCommand::RemovePackage {
+            package_name,
+            request_id,
+        });
+        Ok(())
+    }
+
+    pub fn apply_remove_success(
+        &mut self,
+        package_name: &str,
+        mut refreshed_tool: BlackArchTool,
+        refreshed: bool,
+    ) {
+        self.install_in_progress = false;
+        self.current_remove_request_id = None;
+        self.error_message = None;
+
+        if let Some(existing) = self
+            .tools
+            .iter()
+            .find(|tool| tool.package_name == package_name)
+        {
+            if refreshed_tool.category.is_none() {
+                refreshed_tool.category = existing.category.clone();
+            }
+            if refreshed_tool.categories.is_empty() {
+                refreshed_tool.categories = existing.categories.clone();
+            }
+        }
+
+        self.update_tool_record(package_name, refreshed_tool);
+        self.update_tool_status(package_name, ToolStatus::NotInstalled);
+        self.clear_tool_executables(package_name);
+        self.apply_filters();
+
+        self.status_message = if refreshed {
+            format!("Removed {package_name} successfully")
+        } else {
+            "Removed package, but details could not be refreshed".to_string()
+        };
+    }
+
+    pub fn apply_remove_failure(&mut self, package_name: &str, error: String) {
+        self.install_in_progress = false;
+        self.current_remove_request_id = None;
+        self.error_message = Some(error);
+        self.status_message = format!("Failed to remove {package_name}");
     }
 
     pub fn selected_tool_executable(&self) -> Result<String> {
@@ -517,6 +1017,86 @@ impl App {
                 self.error_message = Some(error);
                 let _ = request_id;
             }
+            WorkerEvent::PackageInstallStarted {
+                package_name,
+                request_id,
+            } => {
+                if self.current_install_request_id == Some(request_id) {
+                    self.status_message = format!("Installing {package_name}...");
+                }
+            }
+            WorkerEvent::PackagesInstallStarted {
+                package_names,
+                request_id,
+            } => {
+                if self.current_install_request_id == Some(request_id) {
+                    self.status_message =
+                        format!("Installing {} package(s)...", package_names.len());
+                }
+            }
+            WorkerEvent::PackageInstallFinished {
+                package_name,
+                request_id,
+                refreshed_tool,
+            } => {
+                if self.current_install_request_id == Some(request_id) {
+                    self.apply_install_success(&package_name, refreshed_tool);
+                }
+            }
+            WorkerEvent::PackagesInstallFinished {
+                package_names,
+                request_id,
+                refreshed_tools,
+            } => {
+                if self.current_install_request_id == Some(request_id) {
+                    self.apply_batch_install_success(&package_names, refreshed_tools);
+                }
+            }
+            WorkerEvent::PackageInstallFailed {
+                package_name,
+                request_id,
+                error,
+            } => {
+                if self.current_install_request_id == Some(request_id) {
+                    self.apply_install_failure(&package_name, error);
+                }
+            }
+            WorkerEvent::PackagesInstallFailed {
+                package_names,
+                request_id,
+                error,
+            } => {
+                if self.current_install_request_id == Some(request_id) {
+                    self.apply_batch_install_failure(&package_names, error);
+                }
+            }
+            WorkerEvent::PackageRemoveStarted {
+                package_name,
+                request_id,
+            } => {
+                if self.current_remove_request_id == Some(request_id) {
+                    self.status_message = format!("Removing {package_name}...");
+                }
+            }
+            WorkerEvent::PackageRemoveFinished {
+                package_name,
+                request_id,
+                refreshed_tool,
+                refreshed,
+            } => {
+                if self.current_remove_request_id == Some(request_id) {
+                    self.apply_remove_success(&package_name, refreshed_tool, refreshed);
+                }
+            }
+            WorkerEvent::PackageRemoveFailed {
+                package_name,
+                request_id,
+                error,
+            } => {
+                if self.current_remove_request_id == Some(request_id) {
+                    self.apply_remove_failure(&package_name, error);
+                }
+            }
             WorkerEvent::TaskFailed { label, error } => {
                 self.loading = false;
                 self.detail_loading = false;
@@ -636,6 +1216,76 @@ impl App {
         }
     }
 
+    fn validate_install_package(&self, package_name: &str) -> Result<()> {
+        if !validate_package_name(package_name) {
+            return Err(AppError::InvalidPackageName(package_name.to_string()));
+        }
+
+        if !self
+            .tools
+            .iter()
+            .any(|tool| tool.package_name == package_name)
+        {
+            return Err(AppError::Config(
+                "Package is not available in the BlackArch tool list".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_remove_package(&self, package_name: &str) -> Result<()> {
+        if !validate_package_name(package_name) {
+            return Err(AppError::InvalidPackageName(package_name.to_string()));
+        }
+
+        let Some(tool) = self
+            .tools
+            .iter()
+            .find(|tool| tool.package_name == package_name)
+        else {
+            return Err(AppError::Config(
+                "Package is not available in the BlackArch tool list".to_string(),
+            ));
+        };
+
+        if tool.status != ToolStatus::Installed {
+            return Err(AppError::Config("Package is not installed".to_string()));
+        }
+
+        Ok(())
+    }
+
+    fn update_tool_status(&mut self, package_name: &str, status: ToolStatus) {
+        for tool in &mut self.tools {
+            if tool.package_name == package_name {
+                tool.status = status.clone();
+            }
+        }
+
+        for tool in &mut self.filtered_tools {
+            if tool.package_name == package_name {
+                tool.status = status.clone();
+            }
+        }
+    }
+
+    fn clear_tool_executables(&mut self, package_name: &str) {
+        for tool in &mut self.tools {
+            if tool.package_name == package_name {
+                tool.executable = None;
+                tool.executables.clear();
+            }
+        }
+
+        for tool in &mut self.filtered_tools {
+            if tool.package_name == package_name {
+                tool.executable = None;
+                tool.executables.clear();
+            }
+        }
+    }
+
     fn apply_user_state_to_tools(&mut self) {
         let favorites = self.user_state.favorites.clone();
         for tool in &mut self.tools {
@@ -697,6 +1347,13 @@ impl App {
                 .any(|recent| recent.package_name == tool.package_name),
             category => matches_category(tool, category),
         }
+    }
+}
+
+fn cancel_message_for_action(action: Option<&ConfirmAction>) -> &'static str {
+    match action {
+        Some(ConfirmAction::RemovePackage { .. }) => "Remove cancelled",
+        _ => "Install cancelled",
     }
 }
 
@@ -964,6 +1621,315 @@ mod tests {
                 .map(|tool| tool.package_name.as_str())
                 .collect::<Vec<_>>(),
             vec!["nmap", "sqlmap"]
+        );
+    }
+
+    #[test]
+    fn open_install_confirmation_creates_modal_state() {
+        let mut app = app_with_tools(vec![tool("sqlmap")]);
+
+        app.open_install_confirmation();
+
+        assert!(app.confirm_modal.visible);
+        assert_eq!(app.confirm_modal.title, "Install Package");
+        assert!(!app.confirm_modal.selected_confirm);
+        assert_eq!(
+            app.confirm_modal.command_preview.as_deref(),
+            Some("pkexec pacman -S --needed --noconfirm sqlmap")
+        );
+    }
+
+    #[test]
+    fn cancel_confirmation_closes_modal() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = app_with_tools(vec![tool("sqlmap")]);
+        app.open_install_confirmation();
+
+        app.confirm_modal_action(&tx).unwrap();
+
+        assert!(!app.confirm_modal.visible);
+        assert_eq!(app.status_message, "Install cancelled");
+    }
+
+    #[test]
+    fn confirmation_toggle_switches_selected_button() {
+        let mut app = app_with_tools(vec![tool("sqlmap")]);
+        app.open_install_confirmation();
+
+        app.toggle_confirmation_selection();
+
+        assert!(app.confirm_modal.selected_confirm);
+    }
+
+    #[test]
+    fn confirmation_sends_install_when_confirm_selected() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = app_with_tools(vec![tool("sqlmap")]);
+        app.open_install_confirmation();
+        app.toggle_confirmation_selection();
+        // Simulate polkit agent being detected to use pkexec
+        app.privilege_status = Some(privilege::PrivilegeStatus {
+            pkexec_found: true,
+            polkit_agent_detected: true,
+            detected_agent: Some("test-agent".to_string()),
+            warnings: vec![],
+        });
+
+        app.confirm_modal_action(&tx).unwrap();
+
+        let command = rx.try_recv().unwrap();
+        assert!(matches!(
+            command,
+            WorkerCommand::InstallPackages { package_names, .. } if package_names == vec!["sqlmap".to_string()]
+        ));
+    }
+
+    #[test]
+    fn invalid_install_package_is_rejected() {
+        let app = app_with_tools(vec![tool("sqlmap")]);
+        let error = app.validate_install_package("bad/name").unwrap_err();
+        assert!(matches!(error, AppError::InvalidPackageName(_)));
+    }
+
+    #[test]
+    fn unavailable_install_package_is_rejected() {
+        let app = app_with_tools(vec![tool("sqlmap")]);
+        let error = app
+            .validate_install_package("nmap")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Package is not available"));
+    }
+
+    #[test]
+    fn duplicate_install_is_blocked() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = app_with_tools(vec![tool("sqlmap")]);
+        app.install_in_progress = true;
+
+        app.start_install_package("sqlmap".to_string(), &tx)
+            .unwrap();
+
+        assert_eq!(
+            app.status_message,
+            "Another package operation is already in progress"
+        );
+    }
+
+    #[test]
+    fn install_success_updates_tool_status() {
+        let mut app = app_with_tools(vec![tool("sqlmap")]);
+
+        app.apply_install_success("sqlmap", None);
+
+        assert_eq!(app.selected_tool().unwrap().status, ToolStatus::Installed);
+        assert_eq!(
+            app.status_message,
+            "Installed packages, but some details could not be refreshed"
+        );
+    }
+
+    #[test]
+    fn install_failure_sets_error_status() {
+        let mut app = app_with_tools(vec![tool("sqlmap")]);
+        app.install_in_progress = true;
+
+        app.apply_install_failure("sqlmap", "auth failed".to_string());
+
+        assert!(!app.install_in_progress);
+        assert_eq!(app.status_message, "Failed to install sqlmap");
+        assert_eq!(app.error_message.as_deref(), Some("auth failed"));
+    }
+
+    #[test]
+    fn successful_batch_install_clears_installed_queue_items() {
+        let mut app = app_with_tools(vec![tool("sqlmap"), tool("nmap")]);
+        app.install_queue.add("sqlmap".to_string());
+        app.install_queue.add("nmap".to_string());
+
+        app.apply_batch_install_success(&["sqlmap".to_string()], Vec::new());
+
+        assert!(!app.install_queue.contains("sqlmap"));
+        assert!(app.install_queue.contains("nmap"));
+    }
+
+    #[test]
+    fn failed_batch_install_keeps_queue() {
+        let mut app = app_with_tools(vec![tool("sqlmap")]);
+        app.install_queue.add("sqlmap".to_string());
+        app.install_in_progress = true;
+
+        app.apply_batch_install_failure(&["sqlmap".to_string()], "auth failed".to_string());
+
+        assert!(app.install_queue.contains("sqlmap"));
+        assert_eq!(app.status_message, "Failed to install sqlmap");
+    }
+
+    #[test]
+    fn remove_modal_opens_only_for_installed_package() {
+        let mut installed = tool("sqlmap");
+        installed.status = ToolStatus::Installed;
+        let mut app = app_with_tools(vec![installed]);
+
+        app.open_remove_confirmation_for_selected_package();
+
+        assert!(app.confirm_modal.visible);
+        assert_eq!(app.confirm_modal.title, "Remove Package");
+        assert_eq!(app.confirm_modal.confirm_label, "Remove");
+        assert_eq!(
+            app.confirm_modal.command_preview.as_deref(),
+            Some("pkexec pacman -Rns --noconfirm sqlmap")
+        );
+    }
+
+    #[test]
+    fn remove_modal_does_not_open_for_not_installed_package() {
+        let mut app = app_with_tools(vec![tool("sqlmap")]);
+
+        app.open_remove_confirmation_for_selected_package();
+
+        assert!(!app.confirm_modal.visible);
+        assert_eq!(app.status_message, "Package is not installed");
+    }
+
+    #[test]
+    fn remove_confirmation_defaults_to_cancel() {
+        let mut installed = tool("sqlmap");
+        installed.status = ToolStatus::Installed;
+        let mut app = app_with_tools(vec![installed]);
+
+        app.open_remove_confirmation_for_selected_package();
+
+        assert!(!app.confirm_modal.selected_confirm);
+    }
+
+    #[test]
+    fn cancel_remove_confirmation_closes_modal() {
+        let (tx, _rx) = mpsc::channel();
+        let mut installed = tool("sqlmap");
+        installed.status = ToolStatus::Installed;
+        let mut app = app_with_tools(vec![installed]);
+        app.open_remove_confirmation_for_selected_package();
+
+        app.confirm_modal_action(&tx).unwrap();
+
+        assert!(!app.confirm_modal.visible);
+        assert_eq!(app.status_message, "Remove cancelled");
+    }
+
+    #[test]
+    fn confirm_remove_sends_worker_command() {
+        let (tx, rx) = mpsc::channel();
+        let mut installed = tool("sqlmap");
+        installed.status = ToolStatus::Installed;
+        let mut app = app_with_tools(vec![installed]);
+        app.open_remove_confirmation_for_selected_package();
+        app.toggle_confirmation_selection();
+        app.privilege_status = Some(privilege::PrivilegeStatus {
+            pkexec_found: true,
+            polkit_agent_detected: true,
+            detected_agent: Some("test-agent".to_string()),
+            warnings: vec![],
+        });
+
+        app.confirm_modal_action(&tx).unwrap();
+
+        let command = rx.try_recv().unwrap();
+        assert!(matches!(
+            command,
+            WorkerCommand::RemovePackage { package_name, .. } if package_name == "sqlmap"
+        ));
+    }
+
+    #[test]
+    fn confirm_remove_uses_pkexec_without_polkit_agent() {
+        let (tx, rx) = mpsc::channel();
+        let mut installed = tool("sqlmap");
+        installed.status = ToolStatus::Installed;
+        let mut app = app_with_tools(vec![installed]);
+        app.open_remove_confirmation_for_selected_package();
+        app.toggle_confirmation_selection();
+        app.privilege_status = Some(privilege::PrivilegeStatus {
+            pkexec_found: true,
+            polkit_agent_detected: false,
+            detected_agent: None,
+            warnings: vec![],
+        });
+
+        app.confirm_modal_action(&tx).unwrap();
+
+        let command = rx.try_recv().unwrap();
+        assert!(matches!(
+            command,
+            WorkerCommand::RemovePackage { package_name, .. } if package_name == "sqlmap"
+        ));
+    }
+
+    #[test]
+    fn remove_success_updates_status_and_clears_executables() {
+        let mut installed = tool("sqlmap");
+        installed.status = ToolStatus::Installed;
+        installed.executable = Some("sqlmap".to_string());
+        installed.executables = vec!["sqlmap".to_string()];
+        let mut app = app_with_tools(vec![installed]);
+        app.install_in_progress = true;
+        app.current_remove_request_id = Some(1);
+        let mut refreshed = tool("sqlmap");
+        refreshed.status = ToolStatus::NotInstalled;
+
+        app.apply_remove_success("sqlmap", refreshed, true);
+
+        let selected = app.selected_tool().unwrap();
+        assert_eq!(selected.status, ToolStatus::NotInstalled);
+        assert_eq!(selected.executable, None);
+        assert!(selected.executables.is_empty());
+        assert!(!app.install_in_progress);
+    }
+
+    #[test]
+    fn remove_failure_keeps_status_unchanged() {
+        let mut installed = tool("sqlmap");
+        installed.status = ToolStatus::Installed;
+        let mut app = app_with_tools(vec![installed]);
+        app.install_in_progress = true;
+
+        app.apply_remove_failure("sqlmap", "auth failed".to_string());
+
+        assert_eq!(app.selected_tool().unwrap().status, ToolStatus::Installed);
+        assert_eq!(app.status_message, "Failed to remove sqlmap");
+        assert_eq!(app.error_message.as_deref(), Some("auth failed"));
+    }
+
+    #[test]
+    fn package_remains_visible_after_remove() {
+        let mut installed = tool("sqlmap");
+        installed.status = ToolStatus::Installed;
+        let mut app = app_with_tools(vec![installed]);
+        let refreshed = tool("sqlmap");
+
+        app.apply_remove_success("sqlmap", refreshed, true);
+
+        assert!(app.tools.iter().any(|tool| tool.package_name == "sqlmap"));
+        assert!(
+            app.filtered_tools
+                .iter()
+                .any(|tool| tool.package_name == "sqlmap")
+        );
+    }
+
+    #[test]
+    fn package_operation_blocks_duplicate_remove() {
+        let (tx, _rx) = mpsc::channel();
+        let mut installed = tool("sqlmap");
+        installed.status = ToolStatus::Installed;
+        let mut app = app_with_tools(vec![installed]);
+        app.install_in_progress = true;
+
+        app.start_remove_package("sqlmap".to_string(), &tx).unwrap();
+
+        assert_eq!(
+            app.status_message,
+            "Another package operation is already in progress"
         );
     }
 

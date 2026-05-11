@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::utils::validate::validate_package_name;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ToolStatus {
     Installed,
@@ -77,6 +79,81 @@ pub struct ActionMenuState {
     pub items: Vec<ActionMenuItem>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ConfirmAction {
+    InstallPackages { packages: Vec<String> },
+    RemovePackage { package_name: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct InstallQueue {
+    pub packages: Vec<String>,
+}
+
+impl InstallQueue {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, package_name: String) -> bool {
+        if !validate_package_name(&package_name) || self.contains(&package_name) {
+            return false;
+        }
+        self.packages.push(package_name);
+        true
+    }
+
+    pub fn remove(&mut self, package_name: &str) -> bool {
+        if let Some(index) = self
+            .packages
+            .iter()
+            .position(|package| package == package_name)
+        {
+            self.packages.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn toggle(&mut self, package_name: String) -> bool {
+        if self.remove(&package_name) {
+            false
+        } else {
+            self.add(package_name)
+        }
+    }
+
+    pub fn contains(&self, package_name: &str) -> bool {
+        self.packages.iter().any(|package| package == package_name)
+    }
+
+    #[allow(dead_code)]
+    pub fn clear(&mut self) {
+        self.packages.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.packages.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.packages.len()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfirmModalState {
+    pub visible: bool,
+    pub title: String,
+    pub message: String,
+    pub command_preview: Option<String>,
+    pub confirm_label: String,
+    pub cancel_label: String,
+    pub selected_confirm: bool,
+    pub action: Option<ConfirmAction>,
+}
+
 impl Default for ActionMenuState {
     fn default() -> Self {
         Self {
@@ -92,6 +169,46 @@ impl Default for ActionMenuState {
                 ActionMenuItem::PackageInfo,
                 ActionMenuItem::Cancel,
             ],
+        }
+    }
+}
+
+impl Default for ConfirmModalState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            title: String::new(),
+            message: String::new(),
+            command_preview: None,
+            confirm_label: "Confirm".to_string(),
+            cancel_label: "Cancel".to_string(),
+            selected_confirm: false,
+            action: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PasswordInputModalState {
+    pub visible: bool,
+    pub title: String,
+    pub message: String,
+    pub password: String,
+    pub confirm_label: String,
+    pub cancel_label: String,
+    pub action: Option<ConfirmAction>,
+}
+
+impl Default for PasswordInputModalState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            title: String::new(),
+            message: String::new(),
+            password: String::new(),
+            confirm_label: "OK".to_string(),
+            cancel_label: "Cancel".to_string(),
+            action: None,
         }
     }
 }
@@ -157,3 +274,27 @@ impl Default for AppConfig {
         }
     }
 }
+
+// #[test]
+// fn install_queue_removes_package() {
+//     let mut queue = InstallQueue::new();
+//     assert!(queue.add("sqlmap".to_string()));
+//     assert!(queue.remove("sqlmap"));
+//     assert!(queue.is_empty());
+// }
+
+// #[test]
+// fn install_queue_toggles_package() {
+//     let mut queue = InstallQueue::new();
+//     assert!(queue.toggle("sqlmap".to_string()));
+//     assert!(queue.contains("sqlmap"));
+//     assert!(!queue.toggle("sqlmap".to_string()));
+//     assert!(!queue.contains("sqlmap"));
+// }
+
+// #[test]
+// fn install_queue_rejects_invalid_package() {
+//     let mut queue = InstallQueue::new();
+//     assert!(!queue.add("bad/name".to_string()));
+//     assert!(queue.is_empty());
+// }

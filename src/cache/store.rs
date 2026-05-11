@@ -2,8 +2,9 @@ use std::{fs, path::Path};
 
 use crate::{
     cache::paths,
-    error::Result,
+    error::{AppError, Result},
     models::{BlackArchTool, CacheMetadata},
+    utils::validate::validate_package_name,
 };
 
 #[allow(dead_code)]
@@ -25,6 +26,15 @@ pub fn save_categories_cache(categories: &[String]) -> Result<()> {
 
 pub fn save_metadata(metadata: &CacheMetadata) -> Result<()> {
     save_json(&paths::metadata_cache_path()?, metadata)
+}
+
+pub fn save_package_detail_cache(package_name: &str, tool: &BlackArchTool) -> Result<()> {
+    if !validate_package_name(package_name) {
+        return Err(AppError::InvalidPackageName(package_name.to_string()));
+    }
+
+    paths::ensure_packages_cache_dir()?;
+    save_json(&paths::package_detail_cache_path(package_name)?, tool)
 }
 
 #[allow(dead_code)]

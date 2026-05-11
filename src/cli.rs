@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 
 use crate::{
-    actions::terminal_runner,
+    actions::{privilege, terminal_runner},
     cache, config,
     error::{AppError, Result},
     models::{BlackArchTool, ToolStatus},
@@ -67,6 +67,24 @@ pub fn run(cli: Cli) -> Result<()> {
 
 fn doctor() -> Result<()> {
     print_check("pacman", command::pacman_exists());
+    let privilege_status = privilege::check_privilege_status();
+
+    println!("Privilege:");
+    if privilege_status.pkexec_found {
+        println!("[ok] pkexec found");
+    } else {
+        println!("[warn] pkexec not found");
+    }
+
+    if let Some(agent) = &privilege_status.detected_agent {
+        println!("[ok] polkit agent detected: {agent}");
+    } else {
+        println!("[warn] no polkit authentication agent detected");
+    }
+
+    for warning in &privilege_status.warnings {
+        println!("[warn] {warning}");
+    }
 
     match query::list_blackarch_categories() {
         Ok(categories) => println!("[ok] BlackArch groups: {} found", categories.len()),
